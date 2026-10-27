@@ -108,6 +108,8 @@ test('the session associates and every mapped property reads back decoded', asyn
   assert.equal(all.unanswered, 0);
   assert.deepEqual(all.channels[1], {
     name: 'Channel1',
+    carrierName: 'Channel1',
+    carrier: 1,
     groupChannel: { group: 1, channel: 1 },
     frequencyMhz: 470.625,
     muted: false,
@@ -115,11 +117,15 @@ test('the session associates and every mapped property reads back decoded', asyn
     gainDb: 16,
     audioMode: 'stereo',
     rfStatus: 1,
+    toneFreqHz: 400,
+    toneLevelDb: -128,
+    inputSource: 'Rear Panel',
+    analogSensitivity: 'Line (+28 dBV FS)',
   });
   assert.equal(all.channels[2].audioMode, 'mono');
   assert.equal(all.channels[3].frequencyMhz, 471.725);
   assert.equal(all.channels[4].txPowerMode, 'Normal');
-  assert.deepEqual(all.device, { encryption: 'Off' });
+  assert.deepEqual(all.device, { encryption: 'Off', model: 'ADTQ', serial: 'VT000000000', name: 'ADTQ', powerLock: false, fanAlwaysOn: false, uptime: '0:07:08', band: 'G57', panelLock: false, opPreset: 1, rfModeCode: 14, rfModeList: [20, 18, 40, 41, 42, 43, 28, 14, 13, 26, 16, 11, 12, 23, 22], rfPowerTable: { 31: 'Low (10 mW), Normal (40 mW), High (126 mW)', 45: 'Low (10 mW), Normal (20 mW), High (100 mW)' } });
 });
 
 test('the audio meters read as left/right dB per channel, apart from the settings read', async (t) => {

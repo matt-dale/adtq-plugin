@@ -15,20 +15,40 @@ import { HttpError } from '@soundbase/plugin-shell';
 import { AdtqDevice } from './driver/adtq/device.js';
 import {
   AUDIO_MODES,
-  CHANNEL_COUNT,
   CHANNEL_NAME_MAX,
+  MODELS,
+  channelsFor,
   FREQ_MAX_KHZ,
   FREQ_MIN_KHZ,
   FREQ_RASTER_KHZ,
   TX_POWER_MODES,
 } from './driver/adtq/properties.js';
+import * as P from './driver/adtq/properties.js';
 import { SLP_PORT, SlpBrowser, describeUacn } from './driver/acn/slp.js';
 import { FakeAdtq } from './driver/fake/fake-adtq.js';
 import { isIpv4, parseAddressList } from './driver/netutil.js';
 
 export const PRODUCT = 'plugin:shure-adtq/adtq';
+/** The two-channel ADTD, announced as its own product; the card is the ADTQ's. */
+export const PRODUCT_ADTD = 'plugin:shure-adtq/adtd';
+/** The product a unit is announced as, from the model it advertises in `acn-fctn`. */
+export const productFor = (fctn) => (channelsFor(fctn) === MODELS.ADTD ? PRODUCT_ADTD : PRODUCT);
+/** The channel count of a product; anything not recognised is the four-channel ADTQ. */
+export const channelsOfProduct = (product) => (product === PRODUCT_ADTD ? MODELS.ADTD : MODELS.ADTQ);
 export const TX_POWER_KEY = 'x.shure-adtq.txPowerMode';
 export const AF_DOTS_KEY = 'x.shure-adtq.afDots';
+/** The unit as a whole: model, serial, band, uptime, Device ID, fan mode, locks. */
+export const UNIT_KEY = 'x.shure-adtq.unit';
+/** Per channel: the carrier channel its RF side lives on (itself in a narrowband preset) and that carrier's composite name. */
+export const CARRIER_KEY = 'x.shure-adtq.carrier';
+/** Per channel: `{ source, sensitivity }` — the input selection and the analog sensitivity. */
+export const INPUT_KEY = 'x.shure-adtq.input';
+/** The tone generator per channel: { level: 'Off' | dB, frequency: Hz }. */
+export const TONE_KEY = 'x.shure-adtq.tone';
+export const FAN_MODES = Object.freeze(['Automatic', 'Always on']);
+const fanModeOf = (alwaysOn) => (alwaysOn == null ? undefined : alwaysOn ? FAN_MODES[1] : FAN_MODES[0]);
+/** The settings that live on the unit rather than on a channel. */
+const DEVICE_PROPERTIES = new Set(['deviceName', 'fanMode', 'powerLock', 'panelLock', 'operationalPreset', 'rfEncryption']);
 export const NET_ID_PREFIX = 'net:';
 export const SIM_DEVICE_ID = 'sim:adtq';
 
@@ -110,7 +130,8 @@ const simulatedDevice = (fake) => ({
 let browser = null;
 let lastDiscoverAt = 0;
 
-const isAdtq = (reply) => /^adtq$/i.test(reply.fctn ?? '');
+// the ADTQ and the two-channel ADTD speak the same map
+const isAdtq = (reply) => /^adt[qd]$/i.test(reply.fctn ?? '');
 
 function ensureBrowser(pluginConfig) {
   const targets = parseAddressList(pluginConfig?.addresses);
@@ -138,8 +159,8 @@ const idleCheck = () => {
 export const discoveredDevice = (reply) => ({
   id: `${NET_ID_PREFIX}${reply.ip}`,
   // the model and band the unit advertises; the variant tag after them is not shown
-  name: `${describeUacn(reply.uacn).label ?? 'ADTQ'} (${reply.ip})`,
-  product: PRODUCT,
+  name: `${describeUacn(reply.uacn).label ?? reply.fctn ?? 'ADTQ'} (${reply.ip})`,
+  product: productFor(reply.fctn),
   transport: { kind: 'network', host: reply.ip, port: reply.port },
   config: { host: reply.ip },
 });
@@ -187,7 +208,7 @@ export function resolveHost(device) {
   throw new Error('an ADTQ needs an IP address (the "IP address" field)');
 }
 
-const propertyDescriptors = () => {
+const propertyDescriptors = (model, modeList) => {
   const channel = (id, value, extra = {}) => ({
     id,
     scope: 'channel',
@@ -208,17 +229,31 @@ const propertyDescriptors = () => {
       unit: 'MHz',
     }),
     channel('channelName', { type: 'string', maxLength: CHANNEL_NAME_MAX }),
-    // read-only by design: raising gain raises the level in someone's ears,
-    // and encryption is a device-wide setting that forces every receiver to
-    // re-sync. Both are shown; both are changed in Workbench.
-    { ...channel('gain', { type: 'number', unit: 'dB' }), access: 'readOnly' },
+    channel('toneLevel', { type: 'enum', options: ['Off', ...P.TONE_LEVELS_DB], unit: 'dB' }, { stateBinding: { key: TONE_KEY, path: ['level'] } }),
+    channel('toneFrequency', { type: 'number', min: P.TONE_FREQ_MIN_HZ, max: P.TONE_FREQ_MAX_HZ, step: 1, unit: 'Hz' }, { stateBinding: { key: TONE_KEY, path: ['frequency'] } }),
+    // gain is writable (the unit takes -20..+16 dB; verified on an ADTD) — it is the level in
+    // someone's ears, so the step is 1 dB and the limits are the unit's own. Encryption stays
+    // read-only: it is device-wide and forces every receiver to re-sync.
+    channel('gain', { type: 'number', min: P.GAIN_MIN_DB, max: P.GAIN_MAX_DB, step: 1, unit: 'dB' }),
+    channel('inputSource', { type: 'enum', options: [...P.INPUT_SOURCES] }, { stateBinding: { key: INPUT_KEY, path: ['source'] } }),
+    channel('analogSensitivity', { type: 'enum', options: [...P.ANALOG_SENSITIVITIES] }, { stateBinding: { key: INPUT_KEY, path: ['sensitivity'] } }),
+    // device-wide: every receiver re-syncs; written at the read address like the other unit settings
     {
       id: 'rfEncryption',
       scope: 'device',
-      access: 'readOnly',
+      access: 'readWrite',
       stateBinding: { key: 'rfEncryption', path: ['enabled'] },
       value: { type: 'boolean' },
     },
+    // the unit's own settings, at the addresses the Axient Digital receivers use (read-confirmed on an ADTD)
+    { id: 'deviceName', scope: 'device', access: 'readWrite', stateBinding: { key: 'deviceName' }, value: { type: 'string', maxLength: P.DEVICE_NAME_MAX } },
+    { id: 'fanMode', scope: 'device', access: 'readWrite', stateBinding: { key: UNIT_KEY, path: ['fanMode'] }, value: { type: 'enum', options: [...FAN_MODES] } },
+    { id: 'powerLock', scope: 'device', access: 'readWrite', stateBinding: { key: UNIT_KEY, path: ['powerLock'] }, value: { type: 'boolean' } },
+    { id: 'panelLock', scope: 'device', access: 'readWrite', stateBinding: { key: UNIT_KEY, path: ['panelLock'] }, value: { type: 'boolean' } },
+    // device-wide, written as Workbench writes it (the mode code); the unit reboots to apply a
+    // change and every channel goes off air for the restart. The options are the presets this
+    // unit's band offers, read from the unit at open.
+    { id: 'operationalPreset', scope: 'device', access: 'readWrite', stateBinding: { key: UNIT_KEY, path: ['operationalPreset'] }, value: { type: 'enum', options: P.presetMenu(model, modeList).map((p) => p.name) } },
   ];
 };
 
@@ -244,6 +279,8 @@ class AdtqMonitoringAdapter {
       }
     }
     this.slpPort = Number.isInteger(device?.config?.slpPort) ? device.config.slpPort : envSlpPort();
+    // the product fixes the channel count the host expects; the unit's advert confirms it at open
+    this.channels = channelsOfProduct(device?.product);
     const poll = Number(pluginConfig.pollIntervalMs);
     this.pollIntervalMs = isNum(poll) ? clamp(poll, MIN_POLL_MS, MAX_POLL_MS) : DEFAULT_POLL_MS;
     const meter = Number(pluginConfig.meterIntervalMs);
@@ -276,6 +313,7 @@ class AdtqMonitoringAdapter {
       multicast: !this.simulated && env('SB_ADTQ_NO_MULTICAST') !== '1',
       unicastSlp: this.simulated,
       session: this.simulated ? SIMULATED_SESSION : {},
+      channels: this.channels,
       log: (level, message) => this.log(level, message),
     });
     unit.on('change', (change) => this.applyChange(change));
@@ -284,6 +322,9 @@ class AdtqMonitoringAdapter {
     unit.on('error', (err) => this.log('warn', `session: ${err?.message || err}`));
     this.unit = unit;
     this.identity = await unit.connect();
+    if (channelsFor(this.identity.model) !== this.channels) {
+      this.log('warn', `${this.host} advertises as ${this.identity.model} (${channelsFor(this.identity.model)} channels) but was added as a ${this.channels}-channel product; remove it and add it again`);
+    }
     if (this.closed) {
       await unit.close();
       throw new Error('closed while connecting');
@@ -296,8 +337,8 @@ class AdtqMonitoringAdapter {
     this.meterTimer = setInterval(() => this.pollMeters().catch(() => {}), this.meterIntervalMs);
     this.meterTimer.unref?.();
     return {
-      channelCount: CHANNEL_COUNT,
-      properties: propertyDescriptors(),
+      channelCount: this.channels,
+      properties: propertyDescriptors(this.identity.model, this.state.device.rfModeList),
       identity: { model: this.identity.model ?? 'ADTQ', firmware: null },
     };
   }
@@ -338,7 +379,7 @@ class AdtqMonitoringAdapter {
       }
       this.lastRefreshAt = Date.now();
       for (const [n, props] of Object.entries(all.channels)) this.mergeChannel(Number(n), props);
-      if (all.device.encryption !== null) this.state.device.encryption = all.device.encryption;
+      for (const [k, v] of Object.entries(all.device)) if (v !== null) this.state.device[k] = v;
       this.emitAll();
       const warnings = [];
       if (all.unanswered > 0) {
@@ -392,7 +433,7 @@ class AdtqMonitoringAdapter {
   }
 
   mergeChannel(n, props) {
-    const ch = (this.state.channels[n] ??= {});
+    const ch = (this.state.channels[n] ??= { index: n });
     for (const [key, value] of Object.entries(props)) if (value !== null) ch[key] = value;
   }
 
@@ -400,7 +441,7 @@ class AdtqMonitoringAdapter {
   applyChange({ channel, key, value }) {
     if (this.closed) return;
     if (channel === null) {
-      if (key === 'encryption') this.state.device.encryption = value;
+      if (value !== null) this.state.device[key] = value;
     } else {
       this.mergeChannel(channel, { [key]: value });
     }
@@ -420,6 +461,7 @@ class AdtqMonitoringAdapter {
   emitAll() {
     const emit = (key, value) => this.onState?.(key, value);
     emit('channelName', this.channelMap((ch) => ch.name));
+    emit(CARRIER_KEY, this.channelMap((ch) => (ch.carrier == null ? undefined : { channel: ch.carrier, name: ch.carrierName ?? undefined, shared: ch.carrier !== ch.index })));
     emit('frequency', this.channelMap((ch) => ch.frequencyMhz));
     emit('groupChannel', this.channelMap((ch) => ch.groupChannel));
     emit('mute', this.channelMap((ch) => ch.muted));
@@ -429,6 +471,18 @@ class AdtqMonitoringAdapter {
     emit(TX_POWER_KEY, this.channelMap((ch) => ch.txPowerMode));
     const enc = this.state.device.encryption;
     if (enc) emit('rfEncryption', { mode: enc, enabled: enc === 'On' });
+    emit(INPUT_KEY, this.channelMap((ch) => (ch.inputSource == null && ch.analogSensitivity == null ? undefined : { source: ch.inputSource ?? undefined, sensitivity: ch.analogSensitivity ?? undefined })));
+    emit(TONE_KEY, this.channelMap((ch) => (ch.toneLevelDb == null && ch.toneFreqHz == null ? undefined : { level: P.toneLevelLabel(ch.toneLevelDb) ?? undefined, frequency: ch.toneFreqHz ?? undefined })));
+    const dev = this.state.device;
+    if (dev.name) emit('deviceName', dev.name);
+    if (dev.model || dev.band || dev.fanAlwaysOn != null) {
+      emit(UNIT_KEY, {
+        model: dev.model, serial: dev.serial, band: dev.band, uptime: dev.uptime, deviceId: dev.name,
+        fanMode: fanModeOf(dev.fanAlwaysOn), powerLock: dev.powerLock, panelLock: dev.panelLock,
+        operationalPreset: P.presetName(dev.model, dev.rfModeList, dev.rfModeCode) ?? undefined,
+        rfPower: dev.rfPowerTable && dev.rfModeCode != null ? dev.rfPowerTable[String(dev.rfModeCode)] : undefined,
+      });
+    }
   }
 
   // -- PropertyControl ------------------------------------------------------------------------
@@ -437,24 +491,26 @@ class AdtqMonitoringAdapter {
     const unit = this.unit;
     if (!unit?.connected)
       throw new HttpError(503, 'device_unavailable', `no live session with the ADTQ at ${this.host}`);
-    const perChannel = ['mute', 'txPowerMode', 'audioMode', 'frequency', 'channelName'];
+    const perChannel = ['mute', 'txPowerMode', 'audioMode', 'frequency', 'channelName', 'toneLevel', 'toneFrequency', 'gain', 'inputSource', 'analogSensitivity'];
     if (perChannel.includes(propertyId)) {
-      if (!Number.isInteger(channelIndex) || channelIndex < 1 || channelIndex > CHANNEL_COUNT) {
-        throw new HttpError(400, 'unknown_channel', `${propertyId} is per channel; channelIndex must be 1..${CHANNEL_COUNT}`);
+      if (!Number.isInteger(channelIndex) || channelIndex < 1 || channelIndex > this.channels) {
+        throw new HttpError(400, 'unknown_channel', `${propertyId} is per channel; channelIndex must be 1..${this.channels}`);
       }
     }
+    // in a wideband preset the RF side of a mix is its carrier channel's
+    const rfChannel = this.state.channels[channelIndex]?.carrier ?? channelIndex;
     let result;
     let key;
     switch (propertyId) {
       case 'mute':
         if (typeof value !== 'boolean') throw badValue(propertyId, 'true or false');
-        result = await unit.setMute(channelIndex, value);
+        result = await unit.setMute(rfChannel, value);
         key = 'muted';
         break;
       case 'txPowerMode':
         if (typeof value !== 'string' || !TX_POWER_MODES.some((m) => m.toLowerCase() === value.toLowerCase()))
           throw badValue(propertyId, `one of ${TX_POWER_MODES.join(', ')}`);
-        result = await unit.setTxPowerMode(channelIndex, value);
+        result = await unit.setTxPowerMode(rfChannel, value);
         key = 'txPowerMode';
         break;
       case 'audioMode':
@@ -465,7 +521,7 @@ class AdtqMonitoringAdapter {
         break;
       case 'frequency':
         if (!isNum(value)) throw badValue(propertyId, 'a number in MHz');
-        result = await unit.setFrequencyMhz(channelIndex, value);
+        result = await unit.setFrequencyMhz(rfChannel, value);
         key = 'frequencyMhz';
         break;
       case 'channelName':
@@ -473,9 +529,62 @@ class AdtqMonitoringAdapter {
         result = await unit.setChannelName(channelIndex, value);
         key = 'name';
         break;
+      case 'toneLevel':
+        if (!(value === 'Off' || P.TONE_LEVELS_DB.includes(Number(value)))) throw badValue(propertyId, `Off or one of ${P.TONE_LEVELS_DB.join(', ')} dB`);
+        result = await unit.setToneLevel(channelIndex, value);
+        key = 'toneLevelDb';
+        result = { ...result, value: result.value === 'Off' ? P.TONE_OFF_DB : result.value };
+        break;
+      case 'toneFrequency':
+        if (!isNum(value) || value < P.TONE_FREQ_MIN_HZ || value > P.TONE_FREQ_MAX_HZ) throw badValue(propertyId, `${P.TONE_FREQ_MIN_HZ}..${P.TONE_FREQ_MAX_HZ} Hz`);
+        result = await unit.setToneFrequencyHz(channelIndex, value);
+        key = 'toneFreqHz';
+        break;
+      case 'deviceName':
+        if (typeof value !== 'string') throw badValue(propertyId, 'a string');
+        result = await unit.setDeviceName(value);
+        key = 'name';
+        break;
+      case 'fanMode':
+        if (!FAN_MODES.includes(value)) throw badValue(propertyId, `one of ${FAN_MODES.join(', ')}`);
+        result = await unit.setFanAlwaysOn(value === FAN_MODES[1]);
+        key = 'fanAlwaysOn';
+        break;
+      case 'powerLock':
+      case 'panelLock':
+        if (typeof value !== 'boolean') throw badValue(propertyId, 'true or false');
+        result = propertyId === 'powerLock' ? await unit.setPowerLock(value) : await unit.setPanelLock(value);
+        key = propertyId;
+        break;
+      case 'operationalPreset': {
+        const menu = P.presetMenu(this.identity?.model, this.state.device.rfModeList);
+        const code = P.presetCode(this.identity?.model, this.state.device.rfModeList, value);
+        if (code === null) throw badValue(propertyId, `one of ${menu.map((p) => p.name).join(' | ')}`);
+        result = await unit.setOperationalPreset(code);
+        if (result.restarting) this.log('info', `${this.host}: operational preset set to ${JSON.stringify(value)}; the unit is restarting to apply it and the session will drop until it is back`);
+        key = 'rfModeCode';
+        break;
+      }
+      case 'inputSource':
+        if (!P.INPUT_SOURCES.includes(value)) throw badValue(propertyId, `one of ${P.INPUT_SOURCES.join(', ')}`);
+        result = await unit.setInputSource(channelIndex, value);
+        key = 'inputSource';
+        break;
+      case 'analogSensitivity':
+        if (!P.ANALOG_SENSITIVITIES.includes(value)) throw badValue(propertyId, `one of ${P.ANALOG_SENSITIVITIES.join(', ')}`);
+        result = await unit.setAnalogSensitivity(channelIndex, value);
+        key = 'analogSensitivity';
+        break;
       case 'gain':
+        if (!isNum(value) || value < P.GAIN_MIN_DB || value > P.GAIN_MAX_DB) throw badValue(propertyId, `${P.GAIN_MIN_DB}..${P.GAIN_MAX_DB} dB`);
+        result = await unit.setGainDb(channelIndex, value);
+        key = 'gainDb';
+        break;
       case 'rfEncryption':
-        throw new HttpError(400, 'read_only', `${propertyId} is read-only in this plugin; change it in Wireless Workbench`);
+        if (typeof value !== 'boolean') throw badValue(propertyId, 'true or false');
+        result = await unit.setEncryption(value);
+        key = 'encryption';
+        break;
       default:
         throw new HttpError(400, 'unknown_property', `No property ${propertyId} on ${PRODUCT}`);
     }
@@ -490,7 +599,11 @@ class AdtqMonitoringAdapter {
       this.log('warn', `${propertyId} on channel ${channelIndex}: the unit did not take ${JSON.stringify(value)}; it reads ${JSON.stringify(result.value)}`);
     }
     // the device is the truth: report what it holds, whether or not that is what was asked
-    this.mergeChannel(channelIndex, { [key]: result.value });
+    if (DEVICE_PROPERTIES.has(propertyId)) this.state.device[key] = result.value;
+    else if (['muted', 'txPowerMode', 'frequencyMhz'].includes(key)) {
+      // every mix on that carrier shares the value
+      for (const [n, ch] of Object.entries(this.state.channels)) if ((ch.carrier ?? Number(n)) === rfChannel) this.mergeChannel(Number(n), { [key]: result.value });
+    } else this.mergeChannel(channelIndex, { [key]: result.value });
     this.emitAll();
   }
 }
