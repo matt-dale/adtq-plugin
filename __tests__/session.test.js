@@ -199,13 +199,23 @@ test('a change made elsewhere arrives as an EVENT on the change feed', async (t)
   ]);
 });
 
+// mulberry32: a seeded draw, so the lossy read loses the same datagrams every run
+const seeded = (seed) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
 test('lost datagrams are retried, and a device that stops answering times out cleanly', async (t) => {
   const fake = await startFake(t);
   const device = await connect(t, fake);
   fake.dropInbound = 0.3;
+  fake.random = seeded(57);
   const all = await device.readChannels([1, 2]);
-  // two attempts at 30% loss leave almost everything answered; what is not is counted
-  assert.ok(all.unanswered <= 4, `${all.unanswered} unanswered`);
+  // two attempts at 30% loss leave almost everything answered (9% per address expected);
+  // what is not is counted. Relative to `asked`, so new properties do not tighten it.
+  assert.ok(all.unanswered < all.asked * 0.2, `${all.unanswered} of ${all.asked} unanswered`);
   fake.dropInbound = 0;
 
   fake.silent = true;

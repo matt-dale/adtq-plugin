@@ -152,6 +152,7 @@ export class FakeAdtq extends EventEmitter {
     this.silent = false; // answer nothing at all (the device went away)
     this.rejectWrites = false; // every SET is ignored
     this.dropInbound = 0; // probability of losing an inbound control datagram
+    this.random = Math.random; // the loss draw; a test seeds it to lose the same datagrams every run
     this.answerSlp = true;
     this.programme = true; // CH1's meters move like music is playing
     this.counters = { joins: 0, gets: 0, sets: 0, events: 0 };
@@ -386,7 +387,7 @@ export class FakeAdtq extends EventEmitter {
 
   onControl(msg, rinfo) {
     if (this.silent) return;
-    if (this.dropInbound > 0 && Math.random() < this.dropInbound) return;
+    if (this.dropInbound > 0 && this.random() < this.dropInbound) return;
     const root = rootParse(msg);
     if (!root) return;
     const peerId = root.cid.toString('hex');
