@@ -259,3 +259,101 @@ ADTQ runs no TFTP server (and no open TCP ports at all), so it cannot be fetched
 the device. Wireless Workbench ships the same data locally at
 `Wireless Workbench.app/Contents/Resources/Data/DDL.dat`, but it is an AES-encrypted ZIP.
 Enumeration plus `watch` is the route used here.
+
+## Added 2026-10-26: the settings shared with the Axient Digital receivers
+
+Read on an ADTD ("ADTD K54 NACLOCK", firmware as shipped) at the addresses the Shure AD4Q/AD4D
+use for the same settings; every one answered with the value its name says. Writes are
+exercised against the fake and on the unit as noted.
+
+| Address | Bytes | Meaning | Evidence |
+|---|---|---|---|
+| `0x01000000` | str | Model | reads `"ADTD"` |
+| `0x01000002` | str | Serial | reads `"VT262460384"` |
+| `0x01000012` | str | Device ID (the unit's name) | reads `"ADTD"` (default = model). **Exposed**, writable (`deviceName`) |
+| `0x01000023` | 1 | Power Lock | reads `00` unlocked. **Exposed**, writable (`powerLock`) |
+| `0x01000025` | 1 | Fan Mode (`00` Auto, `01` On) | reads `00`. **Exposed**, writable (`fanMode`) |
+| `0x0100002b` | str | Uptime | reads `"0:07:08"` |
+| `0x01070003` | str | Band | reads `"K54"` |
+| `0x010c0010` | 1 | Front Panel Lock | reads `00`. **Exposed**, writable (`panelLock`) |
+| `0x0127` (per channel) | 2 | Tone Frequency, Hz | reads `0190` = 400, the default. **Exposed**, writable 400–1000 (`toneFrequency`) |
+| `0x0128` (per channel) | 1 | Tone Level, dB signed; `80` = −128 = Off | reads `80`. **Exposed**, writable Off / −60…0 in 6 dB (`toneLevel`) |
+
+Refused on the ADTD (GET_FAIL 0x02), so receiver-only: `0x01070004` HD mode, `0x01070405`
+antenna bias, channel `0x0104` audio mute, `0x0114` audio level, `0x0125` overload hold,
+`0x0126` tone active, `0x0812`/`0x0813` RF levels, `0x0860` diversity, `0x1212`, `0x110f`/`0x1111`
+transmitter roster.
+
+**Digital gain `0x0102`, write limits** (ADTD, 2026-10-26): −20 … +16 dB taken and read back; −21 and
++17 refused with SET_FAIL 0x05. Exposed writable as `gain`, step 1 dB.
+
+**Operational preset, the RF block** (ADTD, 2026-10-26). A sweep of every device-class address
+before and after Workbench switched the unit from "SC narrowband" to "2-channel wideband" moved
+exactly these, besides the uptime (the unit rebooted) and the temperature-looking byte
+`0x01000024`; a decoded capture of Workbench then showed how it makes the change: **one SET of
+`0x0107000b`** (value 45 for "SC narrowband"), followed by the unit's EVENT on the same address
+and its reboot.
+
+| Address | Before | After | Meaning |
+|---|---|---|---|
+| `0x0107000b` | `2d` (45) | `1f` (31) | **The operational preset, as a transmission-mode code.** This is what Workbench writes. **Exposed**, writable (`operationalPreset`); the unit reboots to apply it. Written live by the plugin's `preset` command (45 → 3, "Narrowband"): the unit restarted and read 3 back |
+| `0x0107000c` | — | — | the mode codes this band offers, **in Workbench's menu order**: ADTD K54 `45,46,32,31,3,2,5,0,1,10,9` (11 = the ADTD menu), ADTQ G57 `20,18,40,41,42,43,28,14,13,26,16,11,12,23,22` (15 = the ADTQ menu). u16 total length, u32 count, a type byte `07`, then u32 codes. Checks: 45 is entry 1 "SC narrowband" and 31 entry 4 "2-channel wideband" on the ADTD, 20 entry 1 "4-channel wideband, spatial diversity" on the ADTQ, and every "combined" entry lands on a 20 mW High entry of the power table |
+| `0x01070052` | `05` | `03` | a derived preset identifier; a SET here is refused with SET_FAIL NOT_WRITABLE. Shown as `id` by the CLI, not exposed |
+| `0x0107000e`, `0x0107000f` | `02` | `01` | move with the preset (carriers and antennas in use?); not exposed |
+| `0x01070088` | — | — | **RF power table**, mode code → "Low (10 mW), Normal (20 mW), High (100 mW)" (31 → 10/40/126 mW; 18 → 10/40/200). u16 length, u32 count, `0e 0e`, then u32-length-prefixed key and label strings; the length counts its own four bytes. Shown as `rfPower` |
+
+**Wideband presets** (ADTQ in "4-channel wideband, spatial diversity", channels 1 and 2 swept
+2026-10-27): every channel keeps its own name at `0x0001` (the name's write address: "Channel2"),
+gain, audio mode, tone and meters, and the `0x0f00`–`0x0f37` block. The RF objects — `0x0802`
+group/channel, `0x0804` frequency, `0x0805`, `0x0809`, `0x080e` mute, `0x0811` power, `0x0814`,
+`0x081f`, `0x0830`, `0x0881`–`0x0885`, `0x08f9`, `0x08fb` (the name's read address, now the
+composite "Channel1,Channel2,Channel3,Channel4"), `0x1000`–`0x1007`, `0x1040`–`0x1047` and
+`0x1600`–`0x1632` — answer only on the carrier channel and are refused (GET_FAIL 0x02, not
+silence) on a mix. The plugin reads the name from `0x0001`, keeps `0x08fb` as `carrierName`, and
+gives a mix its carrier's RF values (`carrier` names the channel); writes of frequency, power and
+mute from a mix go to the carrier. Presets with "2 frequencies" or "4 frequencies" have more than
+one carrier; the rule is the same (a channel that answers `0x0804` is a carrier; one refused belongs
+to the nearest carrier below it) and is tested against the fake only for those.
+
+The capture also lists what Workbench subscribes to and reads at connect, including addresses
+outside every sweep so far: device classes `0x0120`, `0x0130`, `0x0140`, `0x01de`; channel objects
+`0x0f16`–`0x0f27`, `0x1000`–`0x1007`, `0x1605`–`0x1622`, and `0x4001` on channels up to 16. Most of
+the capture's small blocks (32/33/44 bytes, counters near 0x1000 from the first packet on) do not
+decode with the session key and are not understood yet.
+
+**Band change** (ADTD, 2026-10-27, K54 → K60 from the panel's hidden menu): the unit rebooted, came
+back on a link-local address (its static configuration cleared to DHCP), and reset its preset to
+"SC narrowband". Besides the uptime and the temperature byte, these moved:
+
+| Address | K54 | K60 | Meaning |
+|---|---|---|---|
+| `0x01070003` | `"K54"` | `"K60"` | the band string |
+| `0x01030020` | `059ca35a-fd5a-11e3-8dae-0015c5f3f612` | `3233fa64-2932-11ed-8bbf-0015c5f3f612` | a UUID that follows the band — the band definition's id? |
+| `0x0107000c` | 11 codes | 17 codes: `45,46,32,31,33,34,8,6,27,30,3,2,5,0,1,10,9` | the preset list is per band; 33, 34, 8, 6, 27, 30 are not named yet |
+| `0x01070060` | `"Low Normal High"` | `"Low"` | the RF power levels the band allows |
+| `0x01070088` | three levels per mode | `Low (7 mW)` for every mode | the power table |
+
+So preset names must be keyed by code, not by position (`PRESET_NAMES`). A SET of `0x01070003`
+("K54" while on K60) is refused with SET_FAIL NOT_WRITABLE (2026-10-27), and no controller writes the
+band anywhere a capture could show, so **the band is read-only from the network**; the `band`
+command stays as the record of the experiment. The network reset would make a band write unsuitable
+for the plugin's card in any case.
+
+**Encryption, how it is written** (ADTD, 2026-10-27). `0x2000` on channel 1 **is the switch**: a SET of
+`03` or `00` is accepted, the read straight behind it still shows the old value, and 2.5 s later every
+channel reads the new one (probed both ways, 15 s watch each). The first attempt looked ignored only
+because the read-back was immediate. The plugin writes `0x2000` and polls it for up to 4 s.
+
+**Input selection and analog sensitivity** (ADTD, 2026-10-27, decoded capture of Workbench):
+
+| Address | Values | Evidence |
+|---|---|---|
+| `0x017a` per channel | `00` Rear Panel, `01` Dante | Workbench SET `01` then `00` on channel 2, each answered by EVENTs on `0x017a` and `0x0179`. **Exposed**, writable (`inputSource`) |
+| `0x0179` per channel | `03` with Dante selected, `01` with Rear Panel; `02` on an ADTQ | the unit's state for the selection; read only |
+| `0x0612` per channel | `01` Line (+28 dBV FS), `00` Aux (+18 dBV FS) | Workbench SET `01` for Line on channel 1, EVENT back; `00` read on a channel on Aux in the 2026-09 notes. **Exposed**, writable (`analogSensitivity`) |
+| `0x01200006` | `01` while channel 1 is on Dante, `00` otherwise; unchanged by channel 2 | a Dante-side flag, not the selection |
+
+A detour worth recording: an earlier capture labelled "encryption on" held a SET of channel 1's
+`0x017a` = `01`, which is this input selection, so for a while `0x017a` was mistaken for an
+encryption trigger. Workbench sends `0x01d8` = `00` on a channel whenever its panel is opened
+(peak-hold reset or similar); it is not a setting.

@@ -77,19 +77,47 @@ or listed under **Additional ADTQ addresses** in the plugin's settings. Tick
 | Group, channel | `groupChannel` `{ group, channel }` | `0x0802`, confirmed | no |
 | RF mute | `mute`, and `rfState` = not muted | `0x080e`, confirmed by SET round trip | yes (`mute`) |
 | RF power | `x.shure-adtq.txPowerMode` — `Normal` / `High` / `Low` | `0x0811` enum, confirmed over four transitions | yes (`txPowerMode`) |
-| Gain, dB | `gain` | `0x0102` signed byte, confirmed | **no**, by design |
+| Gain, dB | `gain` | `0x0102` signed byte, confirmed | yes (`gain`), −20…+16 in 1 dB steps, the unit's own limits (ADTD, 2026-10-26) |
 | Audio mode | `audioModes.txMode` — `stereo` / `mono` | `0x0613`, confirmed | yes (`audioMode`) |
-| Encryption | `rfEncryption` `{ mode, enabled }`, device-wide | `0x2000`, confirmed | **no**, by design |
-| Unit name | `deviceName` | the model and band from the SLP `acn-uacn` string (`ADTQ G57`); its variant tag is dropped | no |
+| Encryption | `rfEncryption` `{ mode, enabled }`, device-wide | `0x2000`, confirmed | yes (`rfEncryption`) — every receiver re-syncs; written at the read address, applied by the unit ~2 s later (confirmed both ways on an ADTD, 2026-10-27) |
+| Device ID | `deviceName` | `0x01000012`, the unit's name as the panel and Workbench show it | yes (`deviceName`) |
+| Input selection | `x.shure-adtq.input.source` — Rear Panel / Dante, per channel | `0x017a`, from a decoded Workbench capture; written both ways on an ADTD with read-back (2026-10-27) | yes (`inputSource`) |
+| Analog sensitivity | `x.shure-adtq.input.sensitivity` — Aux (+18 dBV FS) / Line (+28 dBV FS), per channel | `0x0612`, from the same capture; written both ways on an ADTD with read-back | yes (`analogSensitivity`) |
+| Tone generator | `x.shure-adtq.tone` `{ level, frequency }` per channel | `0x0128` dB (`Off` = −128), `0x0127` Hz | yes (`toneLevel` Off / −60…0 in 6 dB, `toneFrequency` 400–1000 Hz) |
+| Unit settings | `x.shure-adtq.unit` — model, serial, band, uptime, fan mode, panel lock, power lock | the device-class addresses the Axient Digital receivers use, read-confirmed on an ADTD | fan (`fanMode`), locks (`panelLock`, `powerLock`) |
+| Operational preset | `x.shure-adtq.unit.operationalPreset`, the name as Workbench lists it | `0x0107000b`, the transmission-mode code, which is what Workbench writes (a decoded capture, 2026-10-26); the options are the codes the unit's band offers at `0x0107000c`, in menu order | yes (`operationalPreset`) — **the unit reboots to apply it** and every channel is off air for the restart; the session drops and reconnects |
+| Band | `x.shure-adtq.unit.band` | `0x01070003`; a SET is refused (NOT_WRITABLE), and a band change from the panel resets the unit to DHCP and clears the preset | **no** |
+| RF power table | `x.shure-adtq.unit.rfPower` — "Low (10 mW), Normal (20 mW), High (100 mW)" | `0x01070088`, keyed by the transmission-mode code at `0x0107000b` that the preset selects | no |
 
 RF power is an extension key rather than SoundBase's `txPower` (milliwatts):
 the ADTQ exposes an enum whose indices are identifiers, not a scale (`0` sits
 between `2` and `1`), and the companion level property reads the same on
 Normal and Low, so no honest mW figure exists for it.
 
-**Read-only on purpose.** Gain raises the level in someone's ears; encryption
-is device-wide and forces every receiver to re-sync. Both are shown and
-neither is changed here — change them in Workbench.
+**Two writes to think about before clicking.** Encryption is device-wide and
+forces every receiver to re-sync. Gain is the level in someone's ears, so its
+step is 1 dB and its limits are the unit's own. Both were read-only in earlier
+versions for those reasons and are writable now.
+
+**Wideband presets.** In a wideband preset several channels (mixes) share one
+carrier: the unit answers frequency, group, RF power and mute only on the
+carrier channel, and the name's read address there holds the composite of the
+mixes' names. Each channel's card shows its own name, gain, audio mode, tone and
+meters, plus the carrier's frequency, power and mute, and a "Carrier" cell with
+the carrier's composite name; changing frequency, power or mute on any mix
+changes the carrier. Verified on an ADTQ in "4-channel wideband, spatial
+diversity", on SoundBase's cards (2026-10-27); the 2- and 4-frequency variants follow the same rule but have only
+been exercised against the fake.
+
+**The ADTD.** A second product, `plugin:shure-adtq/adtd`, with two channels;
+discovery offers each unit as its own model. An ADTD answers channels 3 and 4
+with a GET_FAIL, so the driver sizes every read to the model.
+
+**Preset names.** The unit lists the mode codes its band offers in the order
+Workbench's menu shows them, and the plugin names them from that menu (read
+from Workbench for the ADTD and ADTQ). `npm run adtq -- preset <ip> list`
+prints the unit's list with the current one marked; check it against
+Workbench's menu before writing an entry below the fold.
 
 **The card.** SoundBase places the layout's nodes itself, by type and in the
 order the manifest lists them: the two audio meters as one stereo meter, then
@@ -127,6 +155,7 @@ band is refused by the unit and the card keeps showing what it actually holds.
 | Session prologue, reads, writes with read-back, EVENTs, loss, silence, disconnect | against the fake, which is built from the same primitives and the captured behaviour |
 | The adapter and the SoundBase contract | through the real `@soundbase/plugin-shell` over HTTP |
 | **This plugin against a real ADTQ** | **reads and one kind of write.** `discover`, `status` and `name` have run against an ADTQ (2026-09-08/09): SLP lookup with CID, association, a decoded read of every mapped property and the audio meters on all four channels, and channel-name writes confirmed by read-back. RF mute, frequency, power and audio mode have not been written from this port; the Python tool it was ported from has muted the unit. `npm run adtq -- mute <ip> <ch> on` is the next thing to do with a unit in reach. |
+| Writes on an ADTD (2026-10-26) | every writable property was written on channel 2 or the unit and read back, then restored: RF mute, RF power, audio mode, frequency, channel name, tone level and frequency, Device ID, fan mode, both locks, and gain at −20 and +16 (−21 and +17 refused with SET_FAIL 5). The operational preset write is the SET a decoded Workbench capture showed; written live from this plugin on the ADTD (2026-10-26, "SC narrowband" → "Narrowband"), the unit restarted and read the new preset back. |
 | Channel-name writes | exercised on hardware (2026-09-08): a SET on the read address `0x08fb` is refused with SET_FAIL NOT_WRITABLE; the same SET on `0x0001` takes and both addresses read the new name back. The plugin writes `0x0001`. |
 
 ## Requirements
@@ -136,8 +165,13 @@ band is refused by the unit and the card keeps showing what it actually holds.
   both directions. The devices answer SLP **to port 8427**, not to the
   request's source port, so the plugin binds it; when Workbench already owns
   it discovery still works but is less reliable.
-- Nothing else holding a session with the unit. A unit that joins but does not
-  take writes is usually one Workbench is also controlling.
+- **Wireless Workbench can stay open.** The plugin and Workbench each hold their
+  own session with a unit and the unit serves both: discovery, reads, the meter
+  stream and writes (gain, encryption, input selection, sensitivity, presets)
+  all ran from this plugin while Workbench on the same Mac was connected to the
+  same units (2026-10-26/27), and a change made in either shows in the other
+  through the unit's EVENTs. Earlier versions of this README said the two could
+  not be used together; that was never tested and is wrong.
 
 ## Scripts
 

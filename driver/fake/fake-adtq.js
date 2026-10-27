@@ -42,10 +42,11 @@ import {
   sdtPdus,
 } from '../acn/pdu.js';
 import { buildDeviceAdvert, isSrvRqst, SHURE_CID_TAIL } from '../acn/slp.js';
-import { CHANNEL_COUNT, OBJ, chanAddr, decodeString, encodeString, splitAddr } from '../adtq/properties.js';
+import { CHANNEL_COUNT, DEV, DEVICE_NAME_MAX, GAIN_MAX_DB, GAIN_MIN_DB, OBJ, PRESET_NAMES, decodeModeList, encodeModeList, encodePowerTable, isWidebandCode, TONE_FREQ_MAX_HZ, TONE_FREQ_MIN_HZ, TONE_LEVELS_DB, TONE_OFF_DB, chanAddr, channelsFor, decodeString, encodeString, splitAddr } from '../adtq/properties.js';
 
 const noop = () => {};
 const u8 = (n) => Buffer.from([n & 0xff]);
+const RF_OBJS = new Set([OBJ.CHAN_NAME, OBJ.GROUP_CHAN, OBJ.FREQ_KHZ, OBJ.RF_MUTE, OBJ.TX_POWER, OBJ.RF_STATUS]);
 const u32 = (n) => {
   const b = Buffer.alloc(4);
   b.writeUInt32BE(n >>> 0, 0);
@@ -75,8 +76,23 @@ export function dotsFromDb(db) {
 export const FAKE_CID = Buffer.from(`dd2d453e${SHURE_CID_TAIL}`, 'hex');
 
 /** The property map observed on "ADTQ G57 NACLOCK", as raw values. */
-export function defaultProperties() {
+export function defaultProperties(channels = CHANNEL_COUNT, model = 'ADTQ') {
   const props = new Map();
+  // the unit's own settings, as an ADTD read them (2026-10-26)
+  props.set(DEV.MODEL, encodeString(model));
+  props.set(DEV.SERIAL, encodeString('VT000000000'));
+  props.set(DEV.NAME, encodeString(model));
+  props.set(DEV.POWER_LOCK, u8(0));
+  props.set(DEV.FAN_ALWAYS_ON, u8(0));
+  props.set(DEV.UPTIME, encodeString('0:07:08'));
+  props.set(DEV.BAND, encodeString('G57'));
+  props.set(DEV.PANEL_LOCK, u8(0));
+  // the RF block as the units read it: ADTD preset 5 "SC narrowband" with mode code 45, ADTQ preset 1 with mode code 20
+  // the fake boots in a narrowband preset (one carrier per channel); tests switch it to wideband
+  props.set(DEV.OP_PRESET, u8(model === 'ADTD' ? 5 : 1));
+  props.set(DEV.RF_MODE_CODE, u8(model === 'ADTD' ? 45 : 14));
+  props.set(DEV.RF_MODE_LIST, encodeModeList(model === 'ADTD' ? [45, 46, 32, 31, 3, 2, 5, 0, 1, 10, 9] : [20, 18, 40, 41, 42, 43, 28, 14, 13, 26, 16, 11, 12, 23, 22]));
+  props.set(DEV.RF_POWER_TABLE, encodePowerTable({ 45: 'Low (10 mW), Normal (20 mW), High (100 mW)', 31: 'Low (10 mW), Normal (40 mW), High (126 mW)' }));
   const set = (ch, obj, value) => props.set(chanAddr(ch, obj), Buffer.from(value));
   const freqs = [470625, 471225, 471725, 472300];
   const power = [1, 0, 0, 0];
@@ -86,7 +102,7 @@ export function defaultProperties() {
   // CH2/CH4, nothing connected on CH3 (-255)
   const afL = [-18, -118, -255, -106];
   const afR = [-21, -118, -255, -105];
-  for (let ch = 1; ch <= CHANNEL_COUNT; ch += 1) {
+  for (let ch = 1; ch <= channels; ch += 1) {
     set(ch, OBJ.AF_LEVEL_L, i32(afL[ch - 1]));
     set(ch, OBJ.AF_LEVEL_R, i32(afR[ch - 1]));
     set(ch, OBJ.AF_DOTS_L, u8(dotsFromDb(afL[ch - 1])));
@@ -103,7 +119,12 @@ export function defaultProperties() {
     set(ch, OBJ.AUDIO_MODE, u8(mode[ch - 1]));
     set(ch, OBJ.MODEL, encodeString('ADXR-A'));
     set(ch, OBJ.ENCRYPTION, u8(0));
+    set(ch, OBJ.INPUT_SELECT, u8(0));
+    set(ch, OBJ.INPUT_STATE, u8(1));
+    set(ch, OBJ.ANALOG_SENSITIVITY, u8(1));
     set(ch, 0x0805, u8(2));
+    set(ch, OBJ.TONE_FREQ_HZ, Buffer.from([400 >> 8, 400 & 0xff]));
+    set(ch, OBJ.TONE_LEVEL_DB, u8(TONE_OFF_DB & 0xff));
   }
   return props;
 }
@@ -119,7 +140,9 @@ export class FakeAdtq extends EventEmitter {
     this.uacn = uacn;
     this.host = host;
     this.log = log;
-    this.props = defaultProperties();
+    // an ADTD fake has two channels; reads of the others get the GET_FAIL a real ADTD gives
+    this.channels = channelsFor(fctn);
+    this.props = defaultProperties(this.channels, fctn);
     this.slpSock = null;
     this.ctlSock = null;
     this.slpPort = 0;
@@ -171,7 +194,29 @@ export class FakeAdtq extends EventEmitter {
 
   // -- property store ---------------------------------------------------------------------
 
+  /** In a wideband preset: the carrier channels, as the unit lays them out (one per frequency). */
+  carriers() {
+    const code = this.props.get(DEV.RF_MODE_CODE)?.[0];
+    if (!isWidebandCode(code)) return null;
+    const name = PRESET_NAMES[code] ?? '';
+    const perCarrier = /4 frequencies/.test(name) ? 1 : /2 frequencies/.test(name) ? this.channels / 2 : this.channels;
+    const out = [];
+    for (let ch = 1; ch <= this.channels; ch += perCarrier) out.push(ch);
+    return { carriers: out, perCarrier };
+  }
+
   get(addr) {
+    const w = this.carriers();
+    const sp = splitAddr(addr);
+    if (w && sp && sp.channel <= this.channels) {
+      // the unit: RF objects answer only on a carrier; the read-address name there is the composite of its mixes
+      if (RF_OBJS.has(sp.obj) && !w.carriers.includes(sp.channel)) return null;
+      if (sp.obj === OBJ.CHAN_NAME && w.carriers.includes(sp.channel)) {
+        const names = [];
+        for (let ch = sp.channel; ch < sp.channel + w.perCarrier; ch += 1) names.push(decodeString(this.props.get(chanAddr(ch, OBJ.CHAN_NAME_ALT))));
+        return encodeString(names.join(','));
+      }
+    }
     const raw = this.props.get(addr) ?? null;
     const split = raw && splitAddr(addr);
     if (split && split.channel === 1 && this.programme) {
@@ -217,10 +262,33 @@ export class FakeAdtq extends EventEmitter {
    * reason the real unit sends back.
    */
   applySet(addr, value) {
+    if (this.rejectWrites) return false;
     const split = splitAddr(addr);
-    if (!split || this.rejectWrites) return false;
+    if (!split) return this.#applyDeviceSet(addr >>> 0, value);
     const { obj } = split;
     switch (obj) {
+      case OBJ.AUDIO_GAIN_DB: {
+        // the unit: SET_FAIL 0x05 outside -20..+16 dB (ADTD, 2026-10-26)
+        if (value.length !== 1) return false;
+        const db = value.readInt8(0);
+        if (db < GAIN_MIN_DB || db > GAIN_MAX_DB) return { fail: 0x05 };
+        this.props.set(addr, Buffer.from(value));
+        return true;
+      }
+      case OBJ.TONE_LEVEL_DB: {
+        if (value.length !== 1) return false;
+        const db = value.readInt8(0);
+        if (db !== TONE_OFF_DB && !TONE_LEVELS_DB.includes(db)) return false;
+        this.props.set(addr, Buffer.from(value));
+        return true;
+      }
+      case OBJ.TONE_FREQ_HZ: {
+        if (value.length !== 2) return false;
+        const hz = value.readUInt16BE(0);
+        if (hz < TONE_FREQ_MIN_HZ || hz > TONE_FREQ_MAX_HZ) return false;
+        this.props.set(addr, Buffer.from(value));
+        return true;
+      }
       case OBJ.RF_MUTE:
         if (value.length !== 1 || value[0] > 1) return false;
         this.props.set(addr, Buffer.from(value));
@@ -242,6 +310,23 @@ export class FakeAdtq extends EventEmitter {
         if (value.length !== 1 || value[0] > 1) return false;
         this.props.set(addr, Buffer.from(value));
         return true;
+      case OBJ.ENCRYPTION: {
+        // device-wide, applied a moment after the SET: the read-back right behind it still shows the old value
+        if (value.length !== 1 || ![0, 3].includes(value[0])) return { fail: 0x05 };
+        setTimeout(() => { for (let ch = 1; ch <= this.channels; ch += 1) this.props.set(chanAddr(ch, OBJ.ENCRYPTION), Buffer.from(value)); }, 300);
+        return true;
+      }
+      case OBJ.INPUT_SELECT: {
+        // the unit EVENTs the selection and its state (03 Dante, 01 Rear Panel)
+        if (value.length !== 1 || value[0] > 1) return { fail: 0x05 };
+        this.props.set(addr, Buffer.from(value));
+        this.props.set(chanAddr(split.channel, OBJ.INPUT_STATE), u8(value[0] === 1 ? 3 : 1));
+        return true;
+      }
+      case OBJ.ANALOG_SENSITIVITY:
+        if (value.length !== 1 || value[0] > 1) return { fail: 0x05 };
+        this.props.set(addr, Buffer.from(value));
+        return true;
       case OBJ.CHAN_NAME:
         // the real unit: SET_FAIL 0x04 (NOT_WRITABLE); the name is written via 0x0001
         return { fail: 0x04 };
@@ -252,6 +337,35 @@ export class FakeAdtq extends EventEmitter {
         this.props.set(chanAddr(split.channel, OBJ.CHAN_NAME), encodeString(s));
         return true;
       }
+      default:
+        return false;
+    }
+  }
+
+  /** The unit's own settings: the Device ID, the locks and the fan mode take a write; the rest are fixed. */
+  #applyDeviceSet(addr, value) {
+    switch (addr) {
+      case DEV.NAME: {
+        const s = decodeString(value);
+        if (s === null || s.length > DEVICE_NAME_MAX) return false;
+        this.props.set(addr, encodeString(s));
+        return true;
+      }
+      case DEV.RF_MODE_CODE: {
+        // the preset, as Workbench writes it; the unit reboots on this. A code the band does not
+        // offer is refused; the derived identifier follows the two pairs seen on an ADTD
+        const codes = decodeModeList(this.props.get(DEV.RF_MODE_LIST)) ?? [];
+        if (value.length !== 1 || !codes.includes(value[0])) return { fail: 0x05 };
+        this.props.set(addr, Buffer.from(value));
+        this.props.set(DEV.OP_PRESET, u8(value[0] === 31 ? 3 : value[0] === 45 ? 5 : 0));
+        return true;
+      }
+      case DEV.POWER_LOCK:
+      case DEV.PANEL_LOCK:
+      case DEV.FAN_ALWAYS_ON:
+        if (value.length !== 1 || value[0] > 1) return false;
+        this.props.set(addr, Buffer.from(value));
+        return true;
       default:
         return false;
     }

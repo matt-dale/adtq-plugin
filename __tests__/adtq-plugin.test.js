@@ -153,9 +153,11 @@ test('the simulated unit is discovered, then owned and opened by the host', asyn
   assert.equal(device.channelCount, 4);
   assert.deepEqual(
     device.properties.map((p) => p.id),
-    ['mute', 'txPowerMode', 'audioMode', 'frequency', 'channelName', 'gain', 'rfEncryption']
+    ['mute', 'txPowerMode', 'audioMode', 'frequency', 'channelName', 'toneLevel', 'toneFrequency', 'gain', 'inputSource', 'analogSensitivity', 'rfEncryption', 'deviceName', 'fanMode', 'powerLock', 'panelLock', 'operationalPreset']
   );
-  assert.equal(device.properties.find((p) => p.id === 'gain').access, 'readOnly');
+  assert.equal(device.properties.find((p) => p.id === 'gain').access, 'readWrite');
+  assert.deepEqual(device.properties.find((p) => p.id === 'operationalPreset').value.options.slice(0, 2), ['4-channel wideband, spatial diversity', '4-channel wideband']);
+  assert.deepEqual(device.properties.find((p) => p.id === 'gain').value, { type: 'number', min: -20, max: 16, step: 1, unit: 'dB' });
   // the card files nodes by type, in this order: the stereo pair first, then
   // the readings that take its cells
   assert.deepEqual(
@@ -169,7 +171,7 @@ test('the simulated unit is discovered, then owned and opened by the host', asyn
       'indicator:mute',
     ]
   );
-  assert.equal(device.layout.device.length, 3);
+  assert.equal(device.layout.device.length, 16);
   // the 1.1 properties reach the host: the meter style, the mono label on
   // both meters, and what is kept for the list view
   assert.equal(device.layout.meterStyle, 'led');
@@ -184,6 +186,8 @@ test('the simulated unit is discovered, then owned and opened by the host', asyn
       'groupChannel.channel',
       'x.shure-adtq.afDots.left.bar',
       'x.shure-adtq.afDots.right.bar',
+      'x.shure-adtq.tone.level',
+      'x.shure-adtq.tone.frequency',
     ]
   );
 
@@ -280,9 +284,9 @@ test('a command the unit cannot take is 400 with a reason', async () => {
   assert.equal(badValue.status, 400);
   assert.equal(badValue.body.error, 'bad_value');
 
-  const readOnly = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'gain', channelIndex: 1, value: 3 });
-  assert.equal(readOnly.status, 400);
-  assert.equal(readOnly.body.error, 'read_only');
+  const notBool = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'rfEncryption', value: 'yes' });
+  assert.equal(notBool.status, 400);
+  assert.equal(notBool.body.error, 'bad_value');
 });
 
 test('a change made on the unit itself reaches the host as state', async (t) => {
@@ -315,4 +319,25 @@ test('a unit that stops answering marks the device failed, and it reopens when i
   }, 8000, 'ok status');
   assert.equal(ok.channelCount, 4);
   assert.equal(fake.muted(1), false);
+});
+
+test('the unit settings and the tone generator are properties the host can set', async () => {
+  const row = (await request('GET', '/devices')).body.devices.find((d) => d.id === SIM_DEVICE_ID);
+  const ids = new Set(row.properties.map((p) => p.id));
+  for (const id of ['toneLevel', 'toneFrequency', 'deviceName', 'fanMode', 'panelLock', 'powerLock', 'operationalPreset']) assert.ok(ids.has(id), `${id} is offered`);
+  const fake = getSimulator();
+  const tone = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'toneLevel', channelIndex: 2, value: -30 });
+  assert.ok([200, 202].includes(tone.status), JSON.stringify(tone.body));
+  await delay(150);
+  assert.equal(fake.get(chanAddr(2, OBJ.TONE_LEVEL_DB)).readInt8(0), -30);
+  const off = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'toneLevel', channelIndex: 2, value: 'Off' });
+  assert.ok([200, 202].includes(off.status));
+  await delay(150);
+  assert.equal(fake.get(chanAddr(2, OBJ.TONE_LEVEL_DB)).readInt8(0), -128);
+  const fan = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'fanMode', value: 'Always on' });
+  assert.ok([200, 202].includes(fan.status), JSON.stringify(fan.body));
+  await delay(150);
+  assert.equal(fake.get(0x01000025)[0], 1);
+  const bad = await request('POST', `${DEVICE_PATH}/commands`, { propertyId: 'toneLevel', channelIndex: 1, value: -31 });
+  assert.equal(bad.status, 400);
 });

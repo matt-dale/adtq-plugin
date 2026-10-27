@@ -20,6 +20,7 @@
 
 import { createInterface } from 'node:readline';
 import { AdtqDevice } from '../driver/adtq/device.js';
+import { ANALOG_SENSITIVITIES, INPUT_SOURCES, channelList, presetCode, presetMenu, presetName } from '../driver/adtq/properties.js';
 import { SLP_PORT, slpDiscover } from '../driver/acn/slp.js';
 import { isIpv4, parseAddressList } from '../driver/netutil.js';
 
@@ -39,6 +40,11 @@ const log = (level, message) => {
 const out = (s = '') => process.stdout.write(`${s}\n`);
 const usage = () => {
   out('usage: adtq.mjs discover [--addresses a,b] | status <ip> | watch <ip> | mute <ip> <ch> on|off');
+  out('       tone <ip> <ch> off|-60..0 [hz] | devname <ip> <name> | fan <ip> auto|on | lock <ip> panel|power on|off');
+  out('       preset <ip> list | preset <ip> <code|name>       # device-wide; the unit reboots to apply it');
+  out('       input <ip> <ch> rear|dante | sens <ip> <ch> aux|line   # per channel');
+  out('       encryption <ip> on|off                          # device-wide; every receiver re-syncs');
+  out('       band <ip> <K54>                                 # EXPERIMENT: a band change resets the unit to DHCP and clears the preset');
   out('       adtq.mjs freq <ip> <ch> <MHz> | power <ip> <ch> normal|high|low | mode <ip> <ch> stereo|mono | name <ip> <ch> <name>');
   process.exit(2);
 };
@@ -97,11 +103,16 @@ async function status(unit) {
   const all = await unit.readAll();
   out(`${unit.identity.model} "${unit.identity.name}" at ${unit.host}:${unit.identity.port}  cid ${unit.identity.cidText}`);
   out(`encryption (device-wide): ${all.device.encryption ?? '—'}`);
+  const d = all.device;
+  const flag = (v) => (v == null ? '—' : v ? 'on' : 'off');
+  out(`device ID ${JSON.stringify(d.name ?? '—')}  band ${d.band ?? '—'}  serial ${d.serial ?? '—'}  up ${d.uptime ?? '—'}  fan ${d.fanAlwaysOn == null ? '—' : d.fanAlwaysOn ? 'always on' : 'auto'}  panel lock ${flag(d.panelLock)}  power lock ${flag(d.powerLock)}`);
+  const preset = d.rfModeCode == null ? '—' : `${JSON.stringify(presetName(unit.identity.model, d.rfModeList, d.rfModeCode))} (mode code ${d.rfModeCode}, id ${d.opPreset ?? '—'})`;
+  out(`operational preset ${preset}  RF power ${d.rfPowerTable?.[String(d.rfModeCode)] ?? '—'}`);
   out();
   const meters = await unit.readMeters();
-  out('  CH  NAME      GRP,CH  FREQUENCY     RF POWER  GAIN    AUDIO    RF MUTE   AF L/R dB    DOTS L/R');
-  out('  ' + '-'.repeat(96));
-  for (const ch of [1, 2, 3, 4]) {
+  out('  CH  NAME      GRP,CH  FREQUENCY     RF POWER  GAIN    AUDIO    RF MUTE   TONE          AF L/R dB    DOTS L/R');
+  out('  ' + '-'.repeat(110));
+  for (const ch of channelList(unit.channels)) {
     const c = all.channels[ch];
     const m = meters.channels[ch];
     const af = `${m.afDb ?? '—'} / ${m.afRDb ?? '—'}`;
@@ -111,7 +122,9 @@ async function status(unit) {
     const gain = c.gainDb == null ? '—' : `${c.gainDb} dB`;
     out(
       `  ${String(ch).padEnd(4)}${(c.name ?? '—').padEnd(10)}${gc.padEnd(8)}${fmtFreq(c.frequencyMhz).padEnd(14)}` +
-        `${(c.txPowerMode ?? '—').padEnd(10)}${gain.padEnd(8)}${(c.audioMode ?? '—').padEnd(9)}${(c.muted == null ? '—' : c.muted ? 'MUTED' : 'unmuted').padEnd(10)}${af.padEnd(13)}${dots}`
+        `${(c.txPowerMode ?? '—').padEnd(10)}${gain.padEnd(8)}${(c.audioMode ?? '—').padEnd(9)}${(c.muted == null ? '—' : c.muted ? 'MUTED' : 'unmuted').padEnd(10)}${(c.toneLevelDb == null ? '—' : c.toneLevelDb === -128 ? 'Off' : `${c.toneLevelDb} dB @${c.toneFreqHz ?? '?'}`).padEnd(14)}${af.padEnd(13)}${dots}` +
+        `   in ${c.inputSource ?? '—'} / ${c.analogSensitivity ? c.analogSensitivity.split(' ')[0] : '—'}` +
+        (c.carrier != null && c.carrier !== ch ? `   (RF on carrier ${c.carrier})` : c.carrier === ch && c.carrierName && c.carrierName !== c.name ? `   (carrier ${JSON.stringify(c.carrierName)})` : '')
     );
   }
   if (all.unanswered) out(`\n  ${all.unanswered} of ${all.asked} reads went unanswered`);
@@ -174,6 +187,86 @@ try {
       const ch = channelArg(args[2]);
       if (!positional[3]) usage();
       await withUnit(args[1], async (unit) => report('name', ch, await unit.setChannelName(ch, positional.slice(3).join(' ')), JSON.stringify));
+      break;
+    }
+    case 'tone': {
+      const ch = channelArg(args[2]);
+      if (args[3] === undefined) usage();
+      await withUnit(args[1], async (unit) => {
+        report('tone level', ch, await unit.setToneLevel(ch, args[3]), (v) => (v === 'Off' ? 'Off' : `${v} dB`));
+        if (args[4] !== undefined) report('tone frequency', ch, await unit.setToneFrequencyHz(ch, Number(args[4])), (v) => `${v} Hz`);
+      });
+      break;
+    }
+    case 'devname': {
+      if (!positional[2]) usage();
+      await withUnit(args[1], async (unit) => report('device ID', '-', await unit.setDeviceName(positional.slice(2).join(' ')), JSON.stringify));
+      break;
+    }
+    case 'preset': {
+      const want = args[2];
+      await withUnit(args[1], async (unit) => {
+        const dev = await unit.readDevice();
+        const menu = presetMenu(unit.identity.model, dev.rfModeList);
+        if (!want || want === 'list') { for (const p of menu) out(`  ${String(p.code).padStart(3)}  ${p.name}${p.code === dev.rfModeCode ? '   <- current' : ''}`); return; }
+        const code = /^\d+$/.test(want) ? Number(want) : presetCode(unit.identity.model, dev.rfModeList, want);
+        if (code === null || !menu.some((p) => p.code === code)) { out(`no preset ${JSON.stringify(want)} on this unit; try "preset <ip> list"`); return; }
+        const r = await unit.setOperationalPreset(code);
+        const name = (c) => JSON.stringify(presetName(unit.identity.model, dev.rfModeList, c));
+        if (r.refused) out(`  ✗ REFUSED (SET_FAIL ${r.refused}); the unit still reads ${r.value} ${name(r.value)}`);
+        else if (r.restarting) out(`  ✓ taken: ${code} ${name(code)} — the unit is restarting to apply it`);
+        else out(`  ${r.ok ? '✓' : '✗'} reads ${r.value} ${name(r.value)}`);
+      });
+      break;
+    }
+    case 'input': {
+      const ch = channelArg(args[2]);
+      const want = (args[3] ?? '').toLowerCase();
+      const source = want.startsWith('rear') ? INPUT_SOURCES[0] : want === 'dante' ? INPUT_SOURCES[1] : null;
+      if (!source) { out('input <ip> <ch> rear|dante'); break; }
+      await withUnit(args[1], async (unit) => report('input', ch, await unit.setInputSource(ch, source)));
+      break;
+    }
+    case 'sens': {
+      const ch = channelArg(args[2]);
+      const want = (args[3] ?? '').toLowerCase();
+      const level = want === 'aux' ? ANALOG_SENSITIVITIES[0] : want === 'line' ? ANALOG_SENSITIVITIES[1] : null;
+      if (!level) { out('sens <ip> <ch> aux|line'); break; }
+      await withUnit(args[1], async (unit) => report('analog sensitivity', ch, await unit.setAnalogSensitivity(ch, level)));
+      break;
+    }
+    case 'encryption': {
+      const want = (args[2] ?? '').toLowerCase();
+      if (!['on', 'off'].includes(want)) { out('encryption <ip> on|off'); break; }
+      await withUnit(args[1], async (unit) => {
+        const r = await unit.setEncryption(want === 'on');
+        report('encryption', 1, r);
+        out(`  every channel now reads: ${Object.entries(r.copies).map(([ch, v]) => `ch${ch} ${v ?? '—'}`).join(', ')}`);
+      });
+      break;
+    }
+    case 'band': {
+      const want = args[2];
+      if (!want) { out('band <ip> <band>'); break; }
+      await withUnit(args[1], async (unit) => {
+        const r = await unit.setBandExperimental(want);
+        if (r.refused) out(`  ✗ REFUSED (SET_FAIL ${r.refused}); the unit still reads ${JSON.stringify(r.value)}`);
+        else if (r.restarting) out(`  ✓ taken: ${JSON.stringify(r.value)} — the unit is restarting; expect it to come back on DHCP`);
+        else out(`  ${r.ok ? '✓' : '✗'} reads ${JSON.stringify(r.value)}`);
+      });
+      break;
+    }
+    case 'fan': {
+      const on = { auto: false, on: true }[args[2]];
+      if (on === undefined) usage();
+      await withUnit(args[1], async (unit) => report('fan mode', '-', await unit.setFanAlwaysOn(on), (v) => (v ? 'ALWAYS ON' : 'AUTO')));
+      break;
+    }
+    case 'lock': {
+      const which = args[2];
+      const on = { on: true, off: false }[args[3]];
+      if (!['panel', 'power'].includes(which) || on === undefined) usage();
+      await withUnit(args[1], async (unit) => report(`${which} lock`, '-', which === 'panel' ? await unit.setPanelLock(on) : await unit.setPowerLock(on), (v) => (v ? 'LOCKED' : 'UNLOCKED')));
       break;
     }
     default:
