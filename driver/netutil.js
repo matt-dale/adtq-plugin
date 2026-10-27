@@ -50,6 +50,19 @@ export function localIpToward(target, interfaces = networkInterfaces()) {
   return candidates[0]?.address ?? '127.0.0.1';
 }
 
+/** Every non-internal IPv4 address this machine has: the interfaces a browse must ask and listen on. */
+export function localAddresses(interfaces = networkInterfaces()) {
+  const out = [];
+  for (const list of Object.values(interfaces)) {
+    for (const iface of list ?? []) {
+      if (iface.family !== 'IPv4' && iface.family !== 4) continue;
+      if (iface.internal) continue;
+      out.push(iface.address);
+    }
+  }
+  return out;
+}
+
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Splits a comma / whitespace separated address list into IPv4 strings. */

@@ -5,10 +5,13 @@
 //
 //   - The service type is `service:esta.dmp`. `esta.sdt` is only the transport
 //     URL inside the attribute list; a request for it returns nothing.
-//   - The devices answer to UDP/8427 on the requester's address, not to the
-//     request's source port. To hear them the discovery socket must be bound
-//     to 8427 — and something else (Wireless Workbench) may already own it, so
-//     an ephemeral socket is opened as well and both are listened to.
+//   - The devices answer on UDP/8427. An ADTQ and an ADTD on 2026-10-26 sent
+//     their replies to the multicast group itself (239.255.254.253:8427), so
+//     every socket that has joined the group on the right interface hears
+//     them, whoever else holds the port (SoundBase does, for its own Shure
+//     support). What matters is the interface: a request that leaves by the
+//     default route and a membership on that interface alone miss a unit on a
+//     second adapter, so the browse asks and listens on every interface.
 //   - The ADTQ answers a request sent to the multicast group and ignores the
 //     same request unicast to its own address. Looking one unit up therefore
 //     still asks the group (and the unit, for fakes on loopback) and picks
@@ -26,7 +29,7 @@
 
 import dgram from 'node:dgram';
 import { EventEmitter } from 'node:events';
-import { localIpToward } from '../netutil.js';
+import { localAddresses, localIpToward } from '../netutil.js';
 
 export const SLP_PORT = 8427;
 export const SLP_GROUP = '239.255.254.253';
@@ -188,10 +191,10 @@ const bindSocket = (port, options = {}) =>
 
 /**
  * Opens the sockets discovery listens on: the well-known SLP port when it can
- * be had, always an ephemeral one. Both get multicast membership on the
- * interface facing `localIp` (best effort; no network is a normal case).
+ * be had, always an ephemeral one. Both join the multicast group on every
+ * interface in `localIps` (best effort; no network is a normal case).
  */
-async function openSlpSockets({ port, localIp, multicast, log }) {
+async function openSlpSockets({ port, localIps, multicast, log }) {
   const socks = [];
   try {
     socks.push(await bindSocket(port));
@@ -202,12 +205,16 @@ async function openSlpSockets({ port, localIp, multicast, log }) {
   for (const sock of socks) {
     try {
       sock.setMulticastTTL(4);
-      if (multicast && localIp) {
-        sock.setMulticastInterface(localIp);
+    } catch {
+      // not a multicast-capable socket; nothing to set
+    }
+    if (!multicast) continue;
+    for (const localIp of localIps) {
+      try {
         sock.addMembership(SLP_GROUP, localIp);
+      } catch (err) {
+        log?.('debug', `multicast membership failed on ${localIp}: ${err.message}`);
       }
-    } catch (err) {
-      log?.('debug', `multicast setup failed on ${localIp}: ${err.message}`);
     }
   }
   return socks;
@@ -221,7 +228,7 @@ async function openSlpSockets({ port, localIp, multicast, log }) {
  * @param {boolean} [options.multicast=true] also ask the whole segment
  * @param {number} [options.port=8427] the SLP port the devices listen on
  * @param {number} [options.timeoutMs=1500]
- * @param {string} [options.localIp] interface to send from; derived when absent
+ * @param {string} [options.localIp] the one interface to ask on; every interface when absent
  * @param {boolean} [options.stopWhenTargetsAnswer] resolve as soon as every
  *   target has answered instead of waiting out the timeout; defaults to true
  *   for a unicast-only ask and false for a browse, which wants the whole segment
@@ -237,8 +244,9 @@ export async function slpDiscover({
   stopWhenTargetsAnswer = !multicast,
   log,
 } = {}) {
-  const ip = localIp ?? localIpToward(targets[0] ?? SLP_GROUP);
-  const socks = await openSlpSockets({ port, localIp: ip, multicast, log });
+  // the interface a target lives on, plus every other one: a unit on a second adapter answers there
+  const localIps = localIp ? [localIp] : [...new Set([localIpToward(targets[0] ?? SLP_GROUP), ...localAddresses()].filter(Boolean))];
+  const socks = await openSlpSockets({ port, localIps, multicast, log });
   const found = new Map();
   const rqst = buildSrvRqst();
   const destinations = [];
@@ -277,7 +285,19 @@ export async function slpDiscover({
       });
       s.on('error', () => {});
       for (const dst of destinations) {
-        s.send(rqst, port, dst, () => {});
+        if (dst !== SLP_GROUP) {
+          s.send(rqst, port, dst, () => {});
+          continue;
+        }
+        // the group request goes out of every interface, not only the default route's
+        for (const localIp of localIps) {
+          try {
+            s.setMulticastInterface(localIp);
+          } catch {
+            // an interface that will not send multicast is skipped
+          }
+          s.send(rqst, port, dst, () => {});
+        }
       }
     }
   });
